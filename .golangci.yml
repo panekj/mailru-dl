@@ -1,0 +1,24 @@
+---
+linters:
+  enable:
+    - megacheck
+    - govet
+    - golint
+    - gosec
+    - unconvert
+    - dupl
+    - nakedret
+    - prealloc
+    - exportloopref
+    - gocritic
+    - goimports
+    - whitespace
+    - misspell
+linters-settings:
+  gocritic:
+    disabled-checks:
+      - ifElseChain
+  gocyclo:
+    min-complexity: 15
+run:
+  timeout: 3m

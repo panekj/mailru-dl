@@ -1,0 +1,34 @@
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2.1.3
+        with:
+          go-version: 1.16
+      - if: ${{ !env.ACT }}
+        uses: actions/cache@v2
+        with:
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          path: ~/go/pkg/mod
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - run: go build
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v2.1.3
+        with:
+          go-version: 1.16
+      - env:
+          CGO_ENABLED: 0
+        uses: golangci/golangci-lint-action@v2
+        with:
+          version: v1.41.1
+'on':
+  - push
+  - pull_request
+  - workflow_dispatch
