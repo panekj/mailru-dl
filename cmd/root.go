@@ -20,7 +20,7 @@ import (
 	"github.com/panekj/mailru-dl/pkg/types"
 )
 
-const version = "v0.0.0-dev"
+const version = "v0.1.0"
 
 var rootCmd = &cobra.Command{
 	Use:     "mailru-dl",
