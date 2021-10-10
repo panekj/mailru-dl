@@ -19,6 +19,8 @@ import (
 	"github.com/mattn/go-colorable"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/vbauerster/mpb/v7"
+	"github.com/vbauerster/mpb/v7/decor"
 
 	"github.com/panekj/mailru-dl/pkg/types"
 )
@@ -70,7 +72,6 @@ func init() {
 
 // TODO:
 //      - add downloads async
-//      - add progress bar
 func down(args []string) {
 	log.SetFormatter(&logrus.TextFormatter{
 		DisableLevelTruncation: true,
@@ -222,6 +223,23 @@ start:
 		}
 	}
 
+	p := mpb.New(
+		mpb.WithWidth(60),
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+
+	bar := p.Add(info.ContentLength,
+		mpb.NewBarFiller(mpb.BarStyle().Rbound("|")),
+		mpb.PrependDecorators(
+			decor.CountersKibiByte("% .2f / % .2f"),
+		),
+		mpb.AppendDecorators(
+			decor.EwmaETA(decor.ET_STYLE_GO, 90),
+			decor.Name(" ] "),
+			decor.EwmaSpeed(decor.UnitKiB, "% .2f", 60),
+		),
+	)
+
 	file, err := os.Create(name)
 	if err != nil {
 		log.Fatal(err)
@@ -238,10 +256,16 @@ start:
 		}
 	}(resp.Body)
 
-	s, err := io.Copy(file, resp.Body)
+	reader := io.LimitReader(resp.Body, info.ContentLength)
+	proxyReader := bar.ProxyReader(reader)
+	defer proxyReader.Close()
+
+	s, err := io.Copy(file, proxyReader)
 	if err != nil {
 		log.Error(err)
 	}
+
+	p.Wait()
 
 	var diff int64
 	if s > size {
