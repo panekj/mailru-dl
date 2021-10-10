@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/http"
 	"net/http/cookiejar"
@@ -14,13 +16,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-colorable"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/vbauerster/mpb/v7"
+	"github.com/vbauerster/mpb/v7/decor"
 
 	"github.com/panekj/mailru-dl/pkg/types"
 )
 
-const version = "v0.1.0"
+const version = "v0.2.0-dev"
 
 var rootCmd = &cobra.Command{
 	Use:     "mailru-dl",
@@ -33,52 +38,72 @@ var rootCmd = &cobra.Command{
 }
 
 var (
-	log    = logrus.New()
-	cwd, _ = os.Getwd()
-	regex  = regexp.MustCompile(`cloud\.mail\.ru/public/(.+)`)
-	c      = http.Client{
+	log   = logrus.New()
+	regex = regexp.MustCompile(`cloud\.mail\.ru/public/(.+)`)
+	c     = http.Client{
 		Jar: &cookiejar.Jar{},
 		CheckRedirect: func(r *http.Request, via []*http.Request) error {
 			r.URL.Opaque = r.URL.Path
 			return nil
 		},
 	}
+	conf = &flags{}
 )
+
+type flags struct {
+	wait     time.Duration
+	workDir  string
+	logLevel string
+	prefix   bool
+	retry    bool
+}
 
 func Execute() {
 	cobra.CheckErr(rootCmd.Execute())
 }
 
 func init() {
-	cobra.OnInitialize()
-	logLevel := rootCmd.Flags().String("l", "info", "log level")
-
-	log.SetFormatter(&logrus.TextFormatter{
-		DisableColors: false,
-		FullTimestamp: false,
-	})
-
-	if l, err := logrus.ParseLevel(*logLevel); err == nil {
-		log.SetLevel(l)
-	} else {
-		logrus.Warn(err)
-	}
+	rootCmd.Flags().StringVarP(&conf.logLevel, "log-level", "l", "info", "Log level")
+	rootCmd.Flags().StringVarP(&conf.workDir, "workdir", "w", ".", "Download path")
+	rootCmd.Flags().DurationVarP(&conf.wait, "wait", "d", time.Second*5, "Wait time before requests")
+	rootCmd.Flags().BoolVar(&conf.prefix, "prefix", false, "Add unique prefix path to avoid file collision")
+	rootCmd.Flags().BoolVar(&conf.retry, "retry", true, "Automatically retries download if failed")
 }
 
 // TODO:
 //      - add downloads async
-//      - add progress bar
-//      - add download path option
 func down(args []string) {
-	link := strings.TrimSuffix(args[0], `/`)
+	log.SetFormatter(&logrus.TextFormatter{
+		DisableLevelTruncation: true,
+		PadLevelText:           true,
+	})
+	log.SetOutput(colorable.NewColorableStdout())
 
-	if m := regex.FindAllStringSubmatch(link, -1); m != nil {
-		link = m[0][1]
+	if l, err := logrus.ParseLevel(conf.logLevel); err != nil {
+		log.Panic(err)
 	} else {
-		log.Panic("no matches")
+		log.Infof("Log level set to '%s' and '%s' was requested", l.String(), conf.logLevel)
+		log.SetLevel(l)
 	}
 
-	recurseDownload(link, "", 0)
+	for _, link := range args {
+		link := strings.TrimSuffix(link, `/`)
+
+		if m := regex.FindAllStringSubmatch(link, -1); m != nil {
+			log.Debugf("%+v", m)
+			link = m[0][1]
+		} else {
+			log.Errorf("Invalid URL: %s", link)
+		}
+
+		wd := conf.workDir
+		if conf.prefix {
+			l := strings.Split(link, `/`)
+			wd = filepath.Join(wd, l[0], l[1])
+		}
+
+		recurseDownload(link, wd, 0)
+	}
 }
 
 func get(q string, values url.Values) []byte {
@@ -146,7 +171,7 @@ func recurseDownload(weblink, path string, limit int) {
 
 	path = filepath.Join(path, r.Body.Name)
 
-	if err := os.MkdirAll(filepath.Join(cwd, path), 0777); err != nil {
+	if err := os.MkdirAll(path, 0777); err != nil {
 		log.Panic(err)
 	}
 
@@ -168,25 +193,52 @@ func recurseDownload(weblink, path string, limit int) {
 		if v.Type == "folder" {
 			recurseDownload(v.Weblink, path, v.Count.Folders+v.Count.Files)
 		}
+		log.Infof("Sleeping for %d", conf.wait)
+		time.Sleep(conf.wait)
 	}
 }
 
 func fileDownload(name, url, weblink string, size int64) {
+start:
 	log.Debug(weblink)
 	log.Debug(name)
 
+	info, err := c.Head(fmt.Sprintf("%s/%s", url, weblink))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	f, err := os.Stat(name)
-	if os.IsExist(err) {
-		if f.Size() < size {
-			log.Warnf("loc: %v rem: %v", f.Size(), size)
+	if errors.Is(err, fs.ErrNotExist) {
+		log.Debug(err)
+	} else {
+		log.Debugf("loc: %v | rem: %v dif: %v | con: %v dif: %v", f.Size(), size, size-f.Size(), info.ContentLength, info.ContentLength-f.Size())
+		if f.Size() != info.ContentLength {
 			if err = os.Remove(name); err != nil {
 				log.Panic(err)
 			}
 		} else {
-			log.Infof("File %s already downloaded. lsize: %v rsize: %v", name, size, f.Size())
+			log.Infof("File %s already downloaded. Local: %v Remote: %v | Difference: %v", name, size, f.Size(), size-f.Size())
 			return
 		}
 	}
+
+	p := mpb.New(
+		mpb.WithWidth(60),
+		mpb.WithRefreshRate(180*time.Millisecond),
+	)
+
+	bar := p.Add(info.ContentLength,
+		mpb.NewBarFiller(mpb.BarStyle().Rbound("|")),
+		mpb.PrependDecorators(
+			decor.CountersKibiByte("% .2f / % .2f"),
+		),
+		mpb.AppendDecorators(
+			decor.EwmaETA(decor.ET_STYLE_GO, 90),
+			decor.Name(" ] "),
+			decor.EwmaSpeed(decor.UnitKiB, "% .2f", 60),
+		),
+	)
 
 	file, err := os.Create(name)
 	if err != nil {
@@ -195,7 +247,7 @@ func fileDownload(name, url, weblink string, size int64) {
 
 	resp, err := c.Get(fmt.Sprintf("%s/%s", url, weblink))
 	if err != nil {
-		log.Fatal(err)
+		log.Error(err)
 	}
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
@@ -204,13 +256,31 @@ func fileDownload(name, url, weblink string, size int64) {
 		}
 	}(resp.Body)
 
-	s, err := io.Copy(file, resp.Body)
+	reader := io.LimitReader(resp.Body, info.ContentLength)
+	proxyReader := bar.ProxyReader(reader)
+	defer proxyReader.Close()
+
+	s, err := io.Copy(file, proxyReader)
 	if err != nil {
-		log.Panic(err)
+		log.Error(err)
+	}
+
+	p.Wait()
+
+	var diff int64
+	if s > size {
+		diff = s - size
+	} else {
+		diff = size - s
 	}
 
 	if s != size {
-		log.Warnf("Mismatch! Local: %v Remote: %v", s, size)
+		log.Warnf("Mismatch! Local: %v Remote: %v Difference: %v", s, size, diff)
+		if conf.retry {
+			log.Infof("Retrying in %v...", conf.wait)
+			time.Sleep(conf.wait)
+			goto start
+		}
 	}
 
 	defer func(file *os.File) {
@@ -220,5 +290,5 @@ func fileDownload(name, url, weblink string, size int64) {
 		}
 	}(file)
 
-	log.Infof("file: %s size: %d", name, s)
+	log.Infof("File %s downloaded successfully with size %d", name, s)
 }
